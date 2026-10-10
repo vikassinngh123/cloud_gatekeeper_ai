@@ -644,18 +644,17 @@ with tab_zone:
             canvas_bg = Image.fromarray(preview_rgb)
             st.markdown("**Draw a rectangle on the frame below**")
             canvas_result = st_canvas(
-                fill_color="rgba(255, 80, 80, 0.20)",
-                stroke_width=3,
-                stroke_color="#ff4b4b",
-                background_image=canvas_bg,
-                background_color="#ffffff",
-                drawing_mode="rect",
-                height=preview_frame.shape[0],
-                width=preview_frame.shape[1],
-                key=f"zone_canvas_{st.session_state.source_video_signature}_{zone_frame_index}",
-                display_toolbar=True,
-                update_streamlit=True,
-            )
+            fill_color="rgba(255, 80, 80, 0.20)",
+            stroke_width=3,
+            stroke_color="#ff4b4b",
+            background_image=canvas_bg,
+            background_color="#ffffff",
+            drawing_mode="rect",
+            height=preview_frame.shape[0],
+            width=preview_frame.shape[1],
+            key=f"zone_canvas_{st.session_state.source_video_signature}_{zone_frame_index}",
+            update_streamlit=True,
+        )
 
             objects = []
             if canvas_result.json_data and canvas_result.json_data.get("objects"):
