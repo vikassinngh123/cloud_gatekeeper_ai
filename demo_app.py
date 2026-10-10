@@ -652,7 +652,7 @@ with tab_zone:
             drawing_mode="rect",
             height=preview_frame.shape[0],
             width=preview_frame.shape[1],
-            key=f"zone_canvas_{st.session_state.source_video_signature}_{zone_frame_index}",
+            key="static_zone_drawing_canvas",
             update_streamlit=True,
         )
 
