@@ -67,6 +67,7 @@ _STATE_DEFAULTS = {
     "known_names": [],
     "restricted_zone_norm": None,
     "zone_video_signature": None,
+    "zone_canvas_reset": 0,
     "source_video_signature": None,
     "source_video_path": None,
     "source_video_metadata": None,
@@ -643,43 +644,88 @@ with tab_zone:
             preview_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
             canvas_bg = Image.fromarray(preview_rgb)
             st.markdown("**Draw a rectangle on the frame below**")
+            canvas_key = (
+                f"zone_canvas_{st.session_state.source_video_signature}_"
+                f"{zone_frame_index}_{st.session_state.zone_canvas_reset}"
+            )
+            canvas_state_key = f"_{canvas_key}_json"
             canvas_result = st_canvas(
-            fill_color="rgba(255, 80, 80, 0.20)",
-            stroke_width=3,
-            stroke_color="#ff4b4b",
-            background_image=canvas_bg,
-            background_color="#ffffff",
-            drawing_mode="rect",
-            height=preview_frame.shape[0],
-            width=preview_frame.shape[1],
-            key="static_zone_drawing_canvas",
-            update_streamlit=True,
-        )
+                fill_color="rgba(255, 80, 80, 0.20)",
+                stroke_width=3,
+                stroke_color="#ff4b4b",
+                background_image=canvas_bg,
+                background_color="#ffffff",
+                drawing_mode="rect",
+                height=preview_frame.shape[0],
+                width=preview_frame.shape[1],
+                key=canvas_key,
+                # Use our own reset control so the most recent rectangle is retained
+                # reliably when a regular Streamlit button causes a script rerun.
+                display_toolbar=False,
+                update_streamlit=True,
+            )
 
-            objects = []
-            if canvas_result.json_data and canvas_result.json_data.get("objects"):
-                objects = [obj for obj in canvas_result.json_data["objects"] if obj.get("type") == "rect"]
+            # st_canvas may briefly return json_data=None during a Streamlit rerun.
+            # Keep the last payload containing a rectangle so clicking Save does not
+            # discard the drawing just made by the user.
+            incoming_json = canvas_result.json_data
+            if incoming_json is not None:
+                incoming_objects = incoming_json.get("objects", []) or []
+                incoming_rectangles = [
+                    obj for obj in incoming_objects if obj.get("type") == "rect"
+                ]
+                if incoming_rectangles:
+                    st.session_state[canvas_state_key] = incoming_json
 
-            action_col1, action_col2 = st.columns([0.7, 0.3])
+            cached_json = st.session_state.get(canvas_state_key, {})
+            cached_objects = cached_json.get("objects", []) if isinstance(cached_json, dict) else []
+            objects = [obj for obj in (cached_objects or []) if obj.get("type") == "rect"]
+
+            if objects:
+                st.caption(
+                    f"Rectangle detected on the canvas ({len(objects)} found). "
+                    "Click **Save restricted zone** to use the latest rectangle."
+                )
+            else:
+                st.info("No rectangle detected yet. Drag on the video frame to draw one.")
+
+            action_col1, action_col2, action_col3 = st.columns([0.46, 0.27, 0.27])
             with action_col1:
-                save_zone_clicked = st.button("Save restricted zone", type="primary", use_container_width=True)
+                save_zone_clicked = st.button(
+                    "Save restricted zone", type="primary", use_container_width=True
+                )
             with action_col2:
+                clear_drawing_clicked = st.button("Clear drawing", use_container_width=True)
+            with action_col3:
                 clear_zone_clicked = st.button("Clear saved zone", use_container_width=True)
+
+            if clear_drawing_clicked:
+                # Change the component key to create a fresh, empty canvas on rerun.
+                st.session_state.zone_canvas_reset += 1
+                st.session_state.pop(canvas_state_key, None)
+                st.rerun()
 
             if save_zone_clicked:
                 if not objects:
-                    st.warning("Draw a rectangle on the image before saving the zone.")
+                    st.warning(
+                        "No rectangle was received from the drawing canvas. Drag a rectangle "
+                        "over the frame, wait for the canvas to update, then click Save again."
+                    )
                 else:
                     rect = objects[-1]
                     x = float(rect.get("left", 0))
                     y = float(rect.get("top", 0))
                     rect_width = float(rect.get("width", 0)) * float(rect.get("scaleX", 1))
                     rect_height = float(rect.get("height", 0)) * float(rect.get("scaleY", 1))
+                    # Fabric stores a rectangle's left/top and dimensions in canvas pixels.
+                    # Clamp the corners in canvas space before converting to normalized coords.
                     canvas_w, canvas_h = preview_frame.shape[1], preview_frame.shape[0]
-                    x1 = np.clip(x / canvas_w, 0.0, 1.0)
-                    y1 = np.clip(y / canvas_h, 0.0, 1.0)
-                    x2 = np.clip((x + rect_width) / canvas_w, 0.0, 1.0)
-                    y2 = np.clip((y + rect_height) / canvas_h, 0.0, 1.0)
+                    left = float(np.clip(min(x, x + rect_width), 0, canvas_w - 1))
+                    top = float(np.clip(min(y, y + rect_height), 0, canvas_h - 1))
+                    right = float(np.clip(max(x, x + rect_width), 0, canvas_w - 1))
+                    bottom = float(np.clip(max(y, y + rect_height), 0, canvas_h - 1))
+                    x1, y1 = left / canvas_w, top / canvas_h
+                    x2, y2 = right / canvas_w, bottom / canvas_h
                     if (x2 - x1) < 0.01 or (y2 - y1) < 0.01:
                         st.error("The rectangle is too small. Draw a larger zone.")
                     else:
@@ -687,7 +733,7 @@ with tab_zone:
                             [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
                         )
                         st.session_state.zone_video_signature = st.session_state.source_video_signature
-                        st.success("Restricted zone saved for this video.")
+                        st.success("✅ Restricted zone saved for this video. You can now open Analyze video.")
 
             if clear_zone_clicked:
                 st.session_state.restricted_zone_norm = None
@@ -698,7 +744,25 @@ with tab_zone:
                 st.session_state.restricted_zone_norm is not None
                 and st.session_state.zone_video_signature == st.session_state.source_video_signature
             ):
-                st.caption("A restricted zone is saved for the currently uploaded video.")
+                st.caption("✅ A restricted zone is saved for the currently uploaded video.")
+                # Show exactly what will be checked during video analysis.
+                saved_preview = preview_frame.copy()
+                saved_polygon = np.asarray(
+                    [
+                        [int(point[0] * saved_preview.shape[1]), int(point[1] * saved_preview.shape[0])]
+                        for point in st.session_state.restricted_zone_norm
+                    ],
+                    dtype=np.int32,
+                )
+                cv2.polylines(saved_preview, [saved_polygon], True, (0, 200, 255), 3, cv2.LINE_AA)
+                overlay = saved_preview.copy()
+                cv2.fillPoly(overlay, [saved_polygon], (0, 155, 230))
+                saved_preview = cv2.addWeighted(overlay, 0.16, saved_preview, 0.84, 0)
+                st.image(
+                    cv2.cvtColor(saved_preview, cv2.COLOR_BGR2RGB),
+                    caption="Saved restricted zone preview",
+                    use_container_width=True,
+                )
 
 with tab_analyze:
     st.subheader("Analyze and annotate the recording")
