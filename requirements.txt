@@ -1,7 +1,8 @@
 streamlit>=1.53,<2.0
 ultralytics==8.3.40
+lapx>=0.5.2
 opencv-contrib-python-headless==4.10.0.84
-streamlit-drawable-canvas>=0.13.0
+streamlit-drawable-canvas>=0.13.0,<0.14
+streamlit-webrtc>=0.47.1,<1.0
 Pillow>=10.0,<13.0
 numpy>=1.26,<2.0
-streamlit-webrtc>=0.47.1,<1.0

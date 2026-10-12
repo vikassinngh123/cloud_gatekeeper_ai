@@ -660,7 +660,7 @@ def _analyze_video(
                 preview_placeholder.image(
                     last_preview_frame,
                     caption="Analysis preview (updates while processing)",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 fraction = min(frame_index / frames_limit, 1.0)
                 progress_bar.progress(fraction, text=f"Analyzed {processed_frames:,} frames…")
@@ -733,7 +733,7 @@ with st.sidebar:
             help="One email with a cropped person image is queued when a tracked, unrecognized person enters the saved zone. Another email is sent only after the tracker observes that ID outside and then back inside.",
         )
         save_email_settings = st.form_submit_button(
-            "Save email settings", use_container_width=True
+            "Save email settings", width="stretch"
         )
 
     if save_email_settings:
@@ -817,7 +817,7 @@ with tab_enroll:
             except Exception:
                 st.error("Could not preview this image. Try a JPG or PNG file.")
 
-        if st.button("＋ Register face", type="primary", use_container_width=True):
+        if st.button("＋ Register face", type="primary", width="stretch"):
             if not employee_name.strip():
                 st.warning("Enter a name before registering a face.")
             elif face_image is None:
@@ -899,6 +899,7 @@ with tab_zone:
                 key=canvas_key,
                 # Use our own reset control so the most recent rectangle is retained
                 # reliably when a regular Streamlit button causes a script rerun.
+                display_toolbar=False,
                 update_streamlit=True,
             )
 
@@ -909,14 +910,22 @@ with tab_zone:
             if incoming_json is not None:
                 incoming_objects = incoming_json.get("objects", []) or []
                 incoming_rectangles = [
--                    obj for obj in incoming_objects if obj.get("type") == "rect"
-                 ]
+                    obj
+                    for obj in incoming_objects
+                    if isinstance(obj, dict)
+                    and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
+                ]
                 if incoming_rectangles:
                     st.session_state[canvas_state_key] = incoming_json
 
             cached_json = st.session_state.get(canvas_state_key, {})
             cached_objects = cached_json.get("objects", []) if isinstance(cached_json, dict) else []
-            objects = [obj for obj in (cached_objects or []) if obj.get("type") == "rect"]
+            objects = [
+                obj
+                for obj in (cached_objects or [])
+                if isinstance(obj, dict)
+                and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
+            ]
 
             if objects:
                 st.caption(
@@ -924,17 +933,24 @@ with tab_zone:
                     "Click **Save restricted zone** to use the latest rectangle."
                 )
             else:
-                st.info("No rectangle detected yet. Drag on the video frame to draw one.")
+                st.info("No rectangle detected yet. Drag on the video frame to draw one, then wait for the canvas to update.")
+                # Useful diagnostics if the canvas sends a JSON object that our parser does not recognize.
+                diagnostic_json = incoming_json if isinstance(incoming_json, dict) else cached_json
+                diagnostic_objects = diagnostic_json.get("objects", []) if isinstance(diagnostic_json, dict) else []
+                if diagnostic_objects:
+                    object_types = [str(obj.get("type", "<missing type>")) for obj in diagnostic_objects if isinstance(obj, dict)]
+                    if object_types:
+                        st.caption("Canvas object type(s) received: " + ", ".join(object_types))
 
             action_col1, action_col2, action_col3 = st.columns([0.46, 0.27, 0.27])
             with action_col1:
                 save_zone_clicked = st.button(
-                    "Save restricted zone", type="primary", use_container_width=True
+                    "Save restricted zone", type="primary", width="stretch"
                 )
             with action_col2:
-                clear_drawing_clicked = st.button("Clear drawing", use_container_width=True)
+                clear_drawing_clicked = st.button("Clear drawing", width="stretch")
             with action_col3:
-                clear_zone_clicked = st.button("Clear saved zone", use_container_width=True)
+                clear_zone_clicked = st.button("Clear saved zone", width="stretch")
 
             if clear_drawing_clicked:
                 # Change the component key to create a fresh, empty canvas on rerun.
@@ -998,7 +1014,7 @@ with tab_zone:
                 st.image(
                     cv2.cvtColor(saved_preview, cv2.COLOR_BGR2RGB),
                     caption="Saved restricted zone preview",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
 with tab_analyze:
@@ -1033,7 +1049,7 @@ with tab_analyze:
         st.caption(
             "The annotated export is resized to at most 960 pixels on its longest side and does not preserve source audio."
         )
-        start_analysis = st.button("▶ Analyze video", type="primary", use_container_width=True)
+        start_analysis = st.button("▶ Analyze video", type="primary", width="stretch")
 
         if start_analysis:
             progress = st.progress(0, text="Starting video analysis…")
@@ -1100,7 +1116,7 @@ with tab_analyze:
                     file_name="gatekeeper_annotated.mp4",
                     mime="video/mp4",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
             except Exception as exc:
                 st.error(f"Could not preview or prepare the annotated video: {exc}")
@@ -1187,7 +1203,7 @@ with tab_live:
                 st.error(f"Live-frame processing reported an error: {phone_state.last_error}")
 
             refresh_zone_frame = st.button(
-                "Capture/freeze a frame for restricted-zone drawing", use_container_width=True,
+                "Capture/freeze a frame for restricted-zone drawing", width="stretch",
                 key="refresh_phone_zone_frame",
             )
             with phone_state.lock:
@@ -1240,12 +1256,12 @@ with tab_live:
                 save_live_zone, clear_live_zone = st.columns(2)
                 with save_live_zone:
                     save_live_zone_clicked = st.button(
-                        "Save live restricted zone", type="primary", use_container_width=True,
+                        "Save live restricted zone", type="primary", width="stretch",
                         key="save_phone_live_zone",
                     )
                 with clear_live_zone:
                     clear_live_zone_clicked = st.button(
-                        "Clear live zone", use_container_width=True, key="clear_phone_live_zone",
+                        "Clear live zone", width="stretch", key="clear_phone_live_zone",
                     )
                 if save_live_zone_clicked:
                     if not objects:
@@ -1290,7 +1306,7 @@ with tab_live:
                     cv2.fillPoly(overlay, [saved_poly], (0, 155, 230))
                     saved_preview = cv2.addWeighted(overlay, 0.16, saved_preview, 0.84, 0)
                     cv2.polylines(saved_preview, [saved_poly], True, (0, 200, 255), 3, cv2.LINE_AA)
-                    st.image(cv2.cvtColor(saved_preview, cv2.COLOR_BGR2RGB), caption="Saved live restricted zone", use_container_width=True)
+                    st.image(cv2.cvtColor(saved_preview, cv2.COLOR_BGR2RGB), caption="Saved live restricted zone", width="stretch")
         except Exception as exc:
             st.error(f"Could not start phone live mode: {exc}")
     else:
