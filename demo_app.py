@@ -899,7 +899,6 @@ with tab_zone:
                 key=canvas_key,
                 # Use our own reset control so the most recent rectangle is retained
                 # reliably when a regular Streamlit button causes a script rerun.
-                display_toolbar=False,
                 update_streamlit=True,
             )
 
@@ -910,14 +909,23 @@ with tab_zone:
             if incoming_json is not None:
                 incoming_objects = incoming_json.get("objects", []) or []
                 incoming_rectangles = [
-                    obj for obj in incoming_objects if obj.get("type") == "rect"
-                ]
+-                    obj for obj in incoming_objects if obj.get("type") == "rect"
++                    obj
++                    for obj in incoming_objects
++                    if isinstance(obj, dict)
++                    and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
+                 ]
                 if incoming_rectangles:
                     st.session_state[canvas_state_key] = incoming_json
 
             cached_json = st.session_state.get(canvas_state_key, {})
-            cached_objects = cached_json.get("objects", []) if isinstance(cached_json, dict) else []
             objects = [obj for obj in (cached_objects or []) if obj.get("type") == "rect"]
++           objects = [
++                      obj
++                      for obj in (cached_objects or [])
++                      if isinstance(obj, dict)
++                      and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
++                     ]
 
             if objects:
                 st.caption(
