@@ -899,7 +899,6 @@ with tab_zone:
                 key=canvas_key,
                 # Use our own reset control so the most recent rectangle is retained
                 # reliably when a regular Streamlit button causes a script rerun.
-                display_toolbar=False,
                 update_streamlit=True,
             )
 
