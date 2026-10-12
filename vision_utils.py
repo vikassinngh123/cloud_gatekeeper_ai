@@ -72,27 +72,44 @@ def _ensure_model_file(model_key: str) -> Path:
 
 @st.cache_resource(show_spinner=False)
 def load_yolo_model() -> YOLO:
-    """Load the small YOLOv8 model (downloaded automatically by Ultralytics if absent)."""
+    """Load the YOLOv8n model used by uploaded-video analysis."""
     return YOLO("yolov8n.pt")
 
 
-@st.cache_resource(show_spinner=False)
-def load_face_model():
-    """Load OpenCV YuNet face detection and SFace face recognition models."""
+def load_live_yolo_model() -> YOLO:
+    """Create a session-local YOLO instance for phone-camera tracking.
+
+    This intentionally is not cached globally: tracker identities must not be
+    shared between different users' live camera sessions.
+    """
+    return YOLO("yolov8n.pt")
+
+
+def _build_face_models():
+    """Create a detector/recognizer pair using cached-on-disk OpenCV Zoo weights."""
     if not hasattr(cv2, "FaceDetectorYN") or not hasattr(cv2, "FaceRecognizerSF"):
         raise RuntimeError(
             "This OpenCV build does not expose FaceDetectorYN/FaceRecognizerSF. "
             "Install opencv-contrib-python-headless from requirements.txt."
         )
-
     detector_path = _ensure_model_file("yunet")
     recognizer_path = _ensure_model_file("sface")
-
     detector = cv2.FaceDetectorYN.create(
         str(detector_path), "", (320, 320), 0.6, 0.3, 5000
     )
     recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), "")
     return detector, recognizer
+
+
+@st.cache_resource(show_spinner=False)
+def load_face_model():
+    """Load face models dedicated to uploaded-video analysis."""
+    return _build_face_models()
+
+
+def load_live_face_model():
+    """Create a session-local face-model pair for the WebRTC callback."""
+    return _build_face_models()
 
 
 def encode_face(uploaded_file, detector, recognizer):
@@ -114,49 +131,66 @@ def encode_face(uploaded_file, detector, recognizer):
     return recognizer.feature(aligned_face)
 
 
-_LAST_EMAIL_SENT = 0.0
-_EMAIL_COOLDOWN_SECONDS = 60
 _EMAIL_LOCK = threading.Lock()
 
 
-def _send_email_worker(sender_email: str, app_password: str, receiver_email: str) -> None:
-    """Send an alert in a worker thread so video processing is not blocked by SMTP."""
+def _send_email_worker(
+    sender_email: str,
+    app_password: str,
+    receiver_email: str,
+    image_bytes: bytes | None = None,
+    event_details: str = "",
+) -> None:
+    """Send one zone-entry alert with an optional cropped intruder JPEG attachment."""
     message = EmailMessage()
-    message["Subject"] = "GateKeeper AI: Restricted-zone alert"
+    message["Subject"] = "GateKeeper AI: Restricted-zone entry detected"
     message["From"] = sender_email
     message["To"] = receiver_email
+    details = event_details.strip() or "A tracked, unrecognized person entered the restricted zone."
     message.set_content(
-        "GateKeeper AI flagged an unrecognized person in the configured restricted "
-        f"zone while processing a video at {time.strftime('%Y-%m-%d %H:%M:%S')} server time. "
-        "Please review the result before taking action."
+        "GateKeeper AI detected an unrecognized person entering the configured restricted zone.\n\n"
+        f"Event details: {details}\n\n"
+        "A cropped image of the detected person is attached when a usable crop was captured. "
+        "Detection may be wrong; review the image manually."
     )
+    if image_bytes:
+        message.add_attachment(
+            image_bytes,
+            maintype="image",
+            subtype="jpeg",
+            filename=f"gatekeeper_intruder_{time.strftime('%Y%m%d_%H%M%S')}.jpg",
+        )
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=25) as server:
             server.starttls()
             server.login(sender_email, app_password)
             server.send_message(message)
-        print("[GateKeeper AI] Alert email sent.")
-    except Exception as exc:  # Keep a mail issue from interrupting video analysis.
+        print("[GateKeeper AI] Restricted-zone entry alert email sent.")
+    except Exception as exc:  # Do not interrupt video processing if SMTP fails.
         print(f"[GateKeeper AI] Could not send alert email: {exc}")
 
 
-def trigger_intruder_alert(sender: str, app_password: str, receiver: str) -> bool:
-    """Trigger a rate-limited email alert. Returns True only when a thread is started."""
-    global _LAST_EMAIL_SENT
+def trigger_intruder_alert(
+    sender: str,
+    app_password: str,
+    receiver: str,
+    image_bytes: bytes | None = None,
+    event_details: str = "",
+) -> bool:
+    """Queue one alert for a caller-detected entry event.
+
+    Re-entry de-duplication belongs to the object tracker: it emits an alert only
+    when a tracked person changes from outside to inside. There is intentionally no
+    global time cooldown, so a valid leave-and-re-enter event can alert immediately.
+    """
     if not (sender and app_password and receiver):
         return False
-
     with _EMAIL_LOCK:
-        current_time = time.time()
-        if current_time - _LAST_EMAIL_SENT <= _EMAIL_COOLDOWN_SECONDS:
-            return False
-        _LAST_EMAIL_SENT = current_time
-
-    email_thread = threading.Thread(
-        target=_send_email_worker,
-        args=(sender, app_password, receiver),
-        daemon=True,
-    )
-    email_thread.start()
+        email_thread = threading.Thread(
+            target=_send_email_worker,
+            args=(sender, app_password, receiver, image_bytes, event_details),
+            daemon=True,
+        )
+        email_thread.start()
     return True

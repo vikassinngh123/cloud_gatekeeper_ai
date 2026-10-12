@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -11,10 +13,14 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
+import av
+from streamlit_webrtc import webrtc_streamer
 
 from vision_utils import (
     encode_face,
     load_face_model,
+    load_live_face_model,
+    load_live_yolo_model,
     load_yolo_model,
     trigger_intruder_alert,
 )
@@ -190,35 +196,228 @@ def _get_email_settings():
     return None
 
 
-def _match_face(face_crop: np.ndarray, detector, recognizer):
-    """Compare the largest face in a person crop with enrolled face features."""
+def _match_face(
+    face_crop: np.ndarray,
+    detector,
+    recognizer,
+    known_names=None,
+    known_encodings=None,
+):
+    """Compare the largest detected face with enrolled features.
+
+    Explicit lists make this helper safe to use from a WebRTC worker thread.
+    """
     if face_crop.size == 0 or face_crop.shape[0] < 20 or face_crop.shape[1] < 20:
         return None, 0.0
-
     crop_h, crop_w = face_crop.shape[:2]
     detector.setInputSize((crop_w, crop_h))
     _, faces = detector.detect(face_crop)
     if faces is None or len(faces) == 0:
         return None, 0.0
-
     face = max(faces, key=lambda item: float(item[2] * item[3]))
     aligned_face = recognizer.alignCrop(face_crop, face)
     feature = recognizer.feature(aligned_face)
     if feature is None:
         return None, 0.0
-
+    names = known_names if known_names is not None else st.session_state.known_names
+    encodings = known_encodings if known_encodings is not None else st.session_state.known_encodings
     best_name, best_score = None, 0.0
-    for name, known_feature in zip(
-        st.session_state.known_names, st.session_state.known_encodings
-    ):
-        score = float(
-            recognizer.match(
-                known_feature, feature, cv2.FaceRecognizerSF_FR_COSINE
-            )
-        )
+    for name, known_feature in zip(names, encodings):
+        score = float(recognizer.match(known_feature, feature, cv2.FaceRecognizerSF_FR_COSINE))
         if score >= 0.363 and score > best_score:
             best_name, best_score = name, score
     return best_name, best_score
+
+
+class PhoneLiveState:
+    """Mutable state shared safely between Streamlit UI and WebRTC worker thread."""
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.latest_frame = None
+        self.zone_reference_frame = None  # frozen frame used while drawing the live zone
+        self.zone_norm = None
+        self.canvas_json = None
+        self.model = None
+        self.known_names = []
+        self.known_encodings = []
+        self.face_detector = None
+        self.face_recognizer = None
+        self.email_settings = None
+        self.confidence = 0.45
+        self.image_size = 320
+        self.inside_by_track = {}
+        self.alerts_queued = 0
+        self.frame_count = 0
+        self.last_error = None
+
+
+def _jpeg_bytes(frame: np.ndarray) -> bytes | None:
+    """Encode a BGR frame as a JPEG attachment, or return None on failure."""
+    try:
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        return encoded.tobytes() if ok else None
+    except Exception:
+        return None
+
+
+def _intruder_snapshot_bytes(
+    frame: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    padding_fraction: float = 0.16,
+) -> bytes | None:
+    """Encode a padded crop of a detected person for an email attachment."""
+    if frame is None or frame.size == 0:
+        return None
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = map(int, bbox)
+    box_width, box_height = max(1, x2 - x1), max(1, y2 - y1)
+    pad_x = int(box_width * padding_fraction)
+    pad_y = int(box_height * padding_fraction)
+    left = max(0, x1 - pad_x)
+    top = max(0, y1 - pad_y)
+    right = min(width, x2 + pad_x)
+    bottom = min(height, y2 + pad_y)
+    crop = frame[top:bottom, left:right].copy()
+    if crop.size == 0:
+        return None
+    cv2.rectangle(
+        crop,
+        (1, 1),
+        (max(1, crop.shape[1] - 2), max(1, crop.shape[0] - 2)),
+        (0, 0, 230),
+        3,
+        cv2.LINE_AA,
+    )
+    return _jpeg_bytes(crop)
+
+
+def _phone_video_frame_callback(video_frame: av.VideoFrame, live_state: PhoneLiveState) -> av.VideoFrame:
+    """Process phone-camera frames in the WebRTC worker (no Streamlit UI calls here)."""
+    frame = video_frame.to_ndarray(format="bgr24")
+    frame = _fit_preview(frame, max_width=960, max_height=720)
+    # Keep a clean frame for person-specific email attachments before overlays.
+    snapshot_source = frame.copy()
+
+    with live_state.lock:
+        # Keep an unannotated reference frame for drawing the zone in the UI.
+        live_state.latest_frame = frame.copy()
+        model = live_state.model
+        zone_norm = None if live_state.zone_norm is None else live_state.zone_norm.copy()
+        names = list(live_state.known_names)
+        encodings = list(live_state.known_encodings)
+        face_detector = live_state.face_detector
+        face_recognizer = live_state.face_recognizer
+        email_settings = live_state.email_settings
+        confidence = live_state.confidence
+        image_size = live_state.image_size
+
+    if model is None:
+        cv2.putText(frame, "Enable the live monitor to load the detector", (15, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+        return av.VideoFrame.from_ndarray(frame, format="bgr24")
+
+    polygon = None
+    if zone_norm is not None:
+        h, w = frame.shape[:2]
+        polygon = np.asarray([
+            [int(np.clip(p[0] * w, 0, w - 1)), int(np.clip(p[1] * h, 0, h - 1))]
+            for p in zone_norm
+        ], dtype=np.int32)
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [polygon], (0, 155, 230))
+        frame = cv2.addWeighted(overlay, 0.13, frame, 0.87, 0)
+        cv2.polylines(frame, [polygon], True, (0, 220, 255), 3, cv2.LINE_AA)
+        _draw_label(frame, "RESTRICTED ZONE", int(polygon[:, 0].min()),
+                    max(28, int(polygon[:, 1].min())), (15, 113, 160))
+    else:
+        cv2.putText(frame, "Draw and save a restricted zone below", (15, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 170, 255), 2, cv2.LINE_AA)
+
+    new_entry_candidates = []
+    try:
+        predictions = model.track(
+            source=frame,
+            imgsz=image_size,
+            conf=confidence,
+            classes=[0],
+            persist=True,
+            tracker="bytetrack.yaml",
+            verbose=False,
+        )
+        result = predictions[0] if predictions else None
+        if result is not None and result.boxes is not None:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w - 1, x2), min(h - 1, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                track_id = None
+                try:
+                    if box.id is not None:
+                        track_id = int(box.id[0])
+                except Exception:
+                    track_id = None
+
+                foot = (int((x1 + x2) / 2), y2)
+                is_inside = bool(polygon is not None and cv2.pointPolygonTest(polygon, foot, False) >= 0)
+                label = f"Person #{track_id}" if track_id is not None else "Person"
+                color = (220, 145, 35)
+                just_entered = False
+
+                if polygon is not None and track_id is not None:
+                    with live_state.lock:
+                        was_inside = live_state.inside_by_track.get(track_id, False)
+                        just_entered = is_inside and not was_inside
+                        # Update state on every observed frame. Exiting the polygon resets the entry.
+                        live_state.inside_by_track[track_id] = is_inside
+
+                if is_inside:
+                    matched_name = None
+                    if face_detector is not None and face_recognizer is not None:
+                        head_bottom = min(y2, y1 + max(1, int((y2 - y1) * 0.48)))
+                        face_crop = frame[y1:head_bottom, x1:x2]
+                        matched_name, _ = _match_face(
+                            face_crop, face_detector, face_recognizer, names, encodings
+                        )
+                    if matched_name:
+                        label = f"AUTHORIZED: {matched_name[:22]}"
+                        color = (44, 155, 82)
+                    else:
+                        label = "UNRECOGNIZED IN ZONE"
+                        color = (45, 45, 225)
+                        if just_entered and email_settings:
+                            person_image = _intruder_snapshot_bytes(
+                                snapshot_source, (x1, y1, x2, y2)
+                            )
+                            new_entry_candidates.append((track_id, person_image))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+                cv2.circle(frame, foot, 5, color, -1, cv2.LINE_AA)
+                _draw_label(frame, label, x1, max(25, y1 - 3), color)
+
+        # Each entry receives a separate email with that person's cropped snapshot.
+        # Per-track inside state prevents repeated alerts while they remain in the zone.
+        if new_entry_candidates and email_settings:
+            for track_id, person_image in new_entry_candidates:
+                queued = trigger_intruder_alert(
+                    *email_settings,
+                    image_bytes=person_image,
+                    event_details=f"Live phone camera event; tracker ID {track_id}; "
+                                  f"server time {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                )
+                if queued:
+                    with live_state.lock:
+                        live_state.alerts_queued += 1
+    except Exception as exc:
+        with live_state.lock:
+            live_state.last_error = str(exc)
+        cv2.putText(frame, "Live detector error - check app logs", (15, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
+    with live_state.lock:
+        live_state.frame_count += 1
+    return av.VideoFrame.from_ndarray(frame, format="bgr24")
 
 
 def _draw_label(frame: np.ndarray, text: str, x: int, y: int, color: tuple[int, int, int]):
@@ -310,6 +509,10 @@ def _analyze_video(
         email_settings = _get_email_settings()
         email_attempted = False
         email_triggered = False
+        email_event_count = 0
+        # Per-tracker occupancy state: one alert on entry, reset only after a
+        # tracked person is observed outside the polygon.
+        inside_by_track: dict[int, bool] = {}
         processed_frames = 0
         people_detected = 0
         flagged_frames = 0
@@ -346,6 +549,8 @@ def _analyze_video(
                 ],
                 dtype=np.int32,
             )
+            # Keep the clean processed frame for per-person email attachments.
+            snapshot_source = frame.copy()
 
             # Light translucent fill keeps the perimeter visible without hiding people.
             zone_overlay = frame.copy()
@@ -354,17 +559,20 @@ def _analyze_video(
             cv2.polylines(frame, [polygon], True, (0, 220, 255), 3, cv2.LINE_AA)
             _draw_label(frame, "RESTRICTED ZONE", int(polygon[:, 0].min()), max(28, int(polygon[:, 1].min())), (15, 113, 160))
 
-            predictions = model.predict(
+            predictions = model.track(
                 source=frame,
                 imgsz=image_size,
                 conf=confidence,
                 classes=[0],
+                persist=True,
+                tracker="bytetrack.yaml",
                 verbose=False,
             )
             result = predictions[0] if predictions else None
             frame_people = 0
             frame_flagged = 0
 
+            entry_candidates = []
             if result is not None and result.boxes is not None:
                 for person_box in result.boxes:
                     x1, y1, x2, y2 = map(int, person_box.xyxy[0].tolist())
@@ -376,14 +584,26 @@ def _analyze_video(
                     people_detected += 1
                     foot_point = (int((x1 + x2) / 2), y2)
                     is_inside = cv2.pointPolygonTest(polygon, foot_point, False) >= 0
-                    label = "Person"
+                    track_id = None
+                    try:
+                        if person_box.id is not None:
+                            track_id = int(person_box.id[0])
+                    except Exception:
+                        track_id = None
+                    was_inside = inside_by_track.get(track_id, False) if track_id is not None else False
+                    just_entered = is_inside and not was_inside
+                    if track_id is not None:
+                        # An observed outside frame resets the state, allowing a new
+                        # email if this same tracked person enters the zone again.
+                        inside_by_track[track_id] = bool(is_inside)
+
+                    label = f"Person #{track_id}" if track_id is not None else "Person"
                     box_color = (220, 145, 35)  # BGR blue/orange outside the zone.
 
                     if is_inside:
                         frame_people += 1
                         matched_name = None
                         if detector is not None and recognizer is not None:
-                            # The upper part of the person box is used as a face-search region.
                             head_bottom = min(y2, y1 + max(1, int((y2 - y1) * 0.48)))
                             face_crop = frame[y1:head_bottom, x1:x2]
                             matched_name, _ = _match_face(face_crop, detector, recognizer)
@@ -396,13 +616,30 @@ def _analyze_video(
                             box_color = (45, 45, 225)
                             frame_flagged += 1
                             flagged_people += 1
-                            if email_settings and not email_attempted:
-                                email_triggered = trigger_intruder_alert(*email_settings)
+                            if just_entered and track_id is not None and email_settings:
                                 email_attempted = True
+                                person_image = _intruder_snapshot_bytes(
+                                    snapshot_source, (x1, y1, x2, y2)
+                                )
+                                entry_candidates.append((track_id, person_image))
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
                     cv2.circle(frame, foot_point, 5, box_color, -1, cv2.LINE_AA)
                     _draw_label(frame, label, x1, max(25, y1 - 3), box_color)
+
+            if entry_candidates and email_settings:
+                for track_id, person_image in entry_candidates:
+                    queued = trigger_intruder_alert(
+                        *email_settings,
+                        image_bytes=person_image,
+                        event_details=(
+                            f"Uploaded video frame {current_index + 1}; tracker ID {track_id}; "
+                            f"server time {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                        ),
+                    )
+                    if queued:
+                        email_triggered = True
+                        email_event_count += 1
 
             if frame_flagged:
                 flagged_frames += 1
@@ -448,6 +685,7 @@ def _analyze_video(
             "email_configured": bool(email_settings),
             "email_attempted": email_attempted,
             "email_triggered": email_triggered,
+            "email_event_count": email_event_count,
             "enhanced": enhance_low_light,
         }
         return output_path, summary
@@ -490,9 +728,9 @@ with st.sidebar:
             placeholder="recipient@example.com",
         )
         st.checkbox(
-            "Enable email alerts during video analysis",
+            "Enable email alerts during monitoring",
             key="email_alerts_enabled",
-            help="An alert is queued when an unrecognized person is detected inside the saved zone.",
+            help="One email with a cropped person image is queued when a tracked, unrecognized person enters the saved zone. Another email is sent only after the tracker observes that ID outside and then back inside.",
         )
         save_email_settings = st.form_submit_button(
             "Save email settings", use_container_width=True
@@ -558,8 +796,8 @@ else:
     st.info("Upload a video above to enable zone setup and analysis.")
 
 # ---------- Main workflow ----------
-tab_enroll, tab_zone, tab_analyze = st.tabs(
-    ["👤 Face enrollment", "📐 Restricted zone", "🎞️ Analyze video"]
+tab_enroll, tab_zone, tab_analyze, tab_live = st.tabs(
+    ["👤 Face enrollment", "📐 Restricted zone", "🎞️ Analyze video", "📱 Phone live"]
 )
 
 with tab_enroll:
@@ -661,6 +899,7 @@ with tab_zone:
                 key=canvas_key,
                 # Use our own reset control so the most recent rectangle is retained
                 # reliably when a regular Streamlit button causes a script rerun.
+                display_toolbar=False,
                 update_streamlit=True,
             )
 
@@ -671,22 +910,14 @@ with tab_zone:
             if incoming_json is not None:
                 incoming_objects = incoming_json.get("objects", []) or []
                 incoming_rectangles = [
-                                        obj
-                                        for obj in incoming_objects
-                                        if isinstance(obj, dict)
-                                        and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
-                                        ]
+                    obj for obj in incoming_objects if obj.get("type") == "rect"
+                ]
                 if incoming_rectangles:
                     st.session_state[canvas_state_key] = incoming_json
 
             cached_json = st.session_state.get(canvas_state_key, {})
             cached_objects = cached_json.get("objects", []) if isinstance(cached_json, dict) else []
-            objects = [
-                        obj
-                        for obj in (cached_objects or [])
-                        if isinstance(obj, dict)
-                        and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
-                        ]
+            objects = [obj for obj in (cached_objects or []) if obj.get("type") == "rect"]
 
             if objects:
                 st.caption(
@@ -848,9 +1079,12 @@ with tab_analyze:
                 )
             if summary.get("email_configured"):
                 if summary.get("email_triggered"):
-                    st.info("An alert email was queued for delivery. Check the recipient inbox and spam folder.")
+                    st.info(
+                        f"{summary.get('email_event_count', 0)} entry-alert email(s) queued. "
+                        "Each tracked, unrecognized entry includes a JPEG snapshot. Check the recipient inbox and spam folder."
+                    )
                 elif summary.get("email_attempted"):
-                    st.warning("An alert condition occurred, but the email cooldown prevented a new message from being queued.")
+                    st.warning("An unrecognized entry was detected, but no email could be queued. Check your sender settings and app logs.")
                 else:
                     st.caption("Email alerts are enabled, but no unrecognized person was flagged in the processed frames.")
             else:
@@ -871,6 +1105,201 @@ with tab_analyze:
                 )
             except Exception as exc:
                 st.error(f"Could not preview or prepare the annotated video: {exc}")
+
+with tab_live:
+    st.subheader("Live monitoring from a phone or computer camera")
+    st.write(
+        "Open this Streamlit app on your phone, allow camera access, and press **START**. "
+        "This sends live frames from the phone browser to the app for analysis; it does not use the server's webcam."
+    )
+    st.warning(
+        "Live WebRTC depends on network conditions. Streamlit Cloud serves HTTPS, but some networks require a TURN server. "
+        "If the camera stays disconnected, try another network or configure TURN credentials in Streamlit Secrets."
+    )
+    enable_phone_live = st.checkbox(
+        "Enable phone live monitor", value=False, key="enable_phone_live_monitor",
+        help="Loads YOLO and enables the secure browser camera stream when checked."
+    )
+    if enable_phone_live:
+        if "phone_live_state" not in st.session_state:
+            st.session_state.phone_live_state = PhoneLiveState()
+        phone_state: PhoneLiveState = st.session_state.phone_live_state
+        try:
+            if phone_state.model is None:
+                with st.spinner("Loading the person detector for live monitoring…"):
+                    live_model = load_live_yolo_model()
+                with phone_state.lock:
+                    phone_state.model = live_model
+            # Snapshot current settings into the shared live state. The worker does not
+            # read st.session_state directly.
+            with phone_state.lock:
+                phone_state.known_names = list(st.session_state.known_names)
+                phone_state.known_encodings = list(st.session_state.known_encodings)
+                phone_state.email_settings = _get_email_settings()
+                phone_state.confidence = 0.45
+                phone_state.image_size = 320
+            if phone_state.known_encodings and not getattr(phone_state, "face_model_attempted", False):
+                phone_state.face_model_attempted = True
+                try:
+                    with st.spinner("Loading optional face-recognition models…"):
+                        phone_state.face_detector, phone_state.face_recognizer = load_live_face_model()
+                except Exception as exc:
+                    st.warning(f"Face recognition is unavailable in live mode; all zone entries will be treated as unrecognized. Details: {exc}")
+
+            rtc_config = {
+                "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+            }
+            # Optional TURN server values can be added in Streamlit Cloud → Settings → Secrets:
+            # TURN_SERVER_URL = "turn:your-turn-host:3478"
+            # TURN_SERVER_USERNAME = "your-username"
+            # TURN_SERVER_CREDENTIAL = "your-credential"
+            try:
+                turn_url = str(st.secrets.get("TURN_SERVER_URL", "")).strip()
+                turn_username = str(st.secrets.get("TURN_SERVER_USERNAME", "")).strip()
+                turn_credential = str(st.secrets.get("TURN_SERVER_CREDENTIAL", "")).strip()
+                if turn_url and turn_username and turn_credential:
+                    rtc_config["iceServers"].append({
+                        "urls": [turn_url],
+                        "username": turn_username,
+                        "credential": turn_credential,
+                    })
+            except Exception:
+                pass
+
+            webrtc_streamer(
+                key="gatekeeper-phone-live-camera",
+                video_frame_callback=lambda video_frame: _phone_video_frame_callback(video_frame, phone_state),
+                media_stream_constraints={
+                    "video": {
+                        "facingMode": {"ideal": "environment"},
+                        "width": {"ideal": 1280},
+                        "height": {"ideal": 720},
+                    },
+                    "audio": False,
+                },
+                rtc_configuration=rtc_config,
+                async_processing=True,
+            )
+            st.caption(
+                f"Email alerts queued in this live session: {phone_state.alerts_queued}. "
+                "One alert is sent when a tracked, unrecognized person enters; the state resets after they are detected outside the zone."
+            )
+            if phone_state.last_error:
+                st.error(f"Live-frame processing reported an error: {phone_state.last_error}")
+
+            refresh_zone_frame = st.button(
+                "Capture/freeze a frame for restricted-zone drawing", use_container_width=True,
+                key="refresh_phone_zone_frame",
+            )
+            with phone_state.lock:
+                latest = None if phone_state.latest_frame is None else phone_state.latest_frame.copy()
+                if refresh_zone_frame and latest is not None:
+                    phone_state.zone_reference_frame = latest.copy()
+                zone_reference = (
+                    None if phone_state.zone_reference_frame is None
+                    else phone_state.zone_reference_frame.copy()
+                )
+            if zone_reference is None:
+                st.info("Start the camera above, then click **Capture/freeze a frame** to set up the zone.")
+            else:
+                preview_frame = _fit_preview(zone_reference)
+                preview_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+                canvas_bg = Image.fromarray(preview_rgb)
+                st.write("**Draw the restricted rectangle on the latest phone-camera frame**")
+                live_canvas = st_canvas(
+                    fill_color="rgba(255, 80, 80, 0.20)",
+                    stroke_width=3,
+                    stroke_color="#ff4b4b",
+                    background_image=canvas_bg,
+                    background_color="#ffffff",
+                    drawing_mode="rect",
+                    height=preview_frame.shape[0],
+                    width=preview_frame.shape[1],
+                    key="gatekeeper_phone_zone_canvas",
+                    update_streamlit=True,
+                )
+                incoming = live_canvas.json_data
+                if incoming is not None:
+                    incoming_objects = incoming.get("objects", []) or []
+                    incoming_rectangles = [
+                        obj for obj in incoming_objects
+                        if isinstance(obj, dict)
+                        and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
+                    ]
+                    if incoming_rectangles:
+                        phone_state.canvas_json = incoming
+                canvas_json = phone_state.canvas_json or {}
+                objects = [
+                    obj for obj in (canvas_json.get("objects", []) or [])
+                    if isinstance(obj, dict)
+                    and str(obj.get("type", "")).strip().lower() in {"rect", "rectangle"}
+                ]
+                if objects:
+                    st.caption("Rectangle detected. Save it to use the zone for live alerts.")
+                else:
+                    st.info("No rectangle detected yet. Drag a rectangle on the frame above.")
+                save_live_zone, clear_live_zone = st.columns(2)
+                with save_live_zone:
+                    save_live_zone_clicked = st.button(
+                        "Save live restricted zone", type="primary", use_container_width=True,
+                        key="save_phone_live_zone",
+                    )
+                with clear_live_zone:
+                    clear_live_zone_clicked = st.button(
+                        "Clear live zone", use_container_width=True, key="clear_phone_live_zone",
+                    )
+                if save_live_zone_clicked:
+                    if not objects:
+                        st.warning("No rectangle data was received. Draw a rectangle, wait for the canvas to update, and save again.")
+                    else:
+                        rect = objects[-1]
+                        x = float(rect.get("left", 0))
+                        y = float(rect.get("top", 0))
+                        rw = float(rect.get("width", 0)) * float(rect.get("scaleX", 1))
+                        rh = float(rect.get("height", 0)) * float(rect.get("scaleY", 1))
+                        canvas_w, canvas_h = preview_frame.shape[1], preview_frame.shape[0]
+                        left = float(np.clip(min(x, x + rw), 0, canvas_w - 1))
+                        top = float(np.clip(min(y, y + rh), 0, canvas_h - 1))
+                        right = float(np.clip(max(x, x + rw), 0, canvas_w - 1))
+                        bottom = float(np.clip(max(y, y + rh), 0, canvas_h - 1))
+                        if right - left < 5 or bottom - top < 5:
+                            st.error("The rectangle is too small. Draw a larger zone.")
+                        else:
+                            with phone_state.lock:
+                                phone_state.zone_norm = np.asarray(
+                                    [[left / canvas_w, top / canvas_h],
+                                     [right / canvas_w, top / canvas_h],
+                                     [right / canvas_w, bottom / canvas_h],
+                                     [left / canvas_w, bottom / canvas_h]], dtype=np.float32
+                                )
+                                phone_state.inside_by_track.clear()
+                            st.success("Live restricted zone saved. Watch the live stream for entry detections.")
+                if clear_live_zone_clicked:
+                    with phone_state.lock:
+                        phone_state.zone_norm = None
+                        phone_state.inside_by_track.clear()
+                    st.success("Live restricted zone cleared.")
+                with phone_state.lock:
+                    saved_live_zone = None if phone_state.zone_norm is None else phone_state.zone_norm.copy()
+                if saved_live_zone is not None:
+                    saved_preview = preview_frame.copy()
+                    saved_poly = np.asarray([
+                        [int(point[0] * saved_preview.shape[1]), int(point[1] * saved_preview.shape[0])]
+                        for point in saved_live_zone
+                    ], dtype=np.int32)
+                    overlay = saved_preview.copy()
+                    cv2.fillPoly(overlay, [saved_poly], (0, 155, 230))
+                    saved_preview = cv2.addWeighted(overlay, 0.16, saved_preview, 0.84, 0)
+                    cv2.polylines(saved_preview, [saved_poly], True, (0, 200, 255), 3, cv2.LINE_AA)
+                    st.image(cv2.cvtColor(saved_preview, cv2.COLOR_BGR2RGB), caption="Saved live restricted zone", use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not start phone live mode: {exc}")
+    else:
+        st.info(
+            "For a live feed, open the deployed HTTPS app on the phone and enable the monitor above. "
+            "You can still use the Upload a recording workflow when live WebRTC is not available on your network."
+        )
+
 
 st.divider()
 st.markdown(
